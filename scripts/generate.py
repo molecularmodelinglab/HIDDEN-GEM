@@ -1,4 +1,5 @@
 import os
+import logging
 import time
 from datetime import datetime
 from typing import Optional, Literal, List
@@ -23,6 +24,12 @@ from rdkit.ML.Cluster import Butina
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
+logger = logging.getLogger("generate")
+logger.setLevel(logging.DEBUG)
+# create file handler which logs even debug messages
+fh = logging.FileHandler('tmp.log')
+fh.setLevel(logging.DEBUG)
+logger.addHandler(fh)
 
 TOKENS = (
     'X', '<', '>', '#', '%', ')', '(', '+', '-', '/', '.', '1', '0', '3', '2',
@@ -75,24 +82,33 @@ def calc_morgan(mol, radius=4, n_bits=256, count=False, use_chirality=True):
     return _fp
 
 
-def get_fps(smis, func: Literal["morgan", "rdkit"]):
+def get_fps(smis, y, func: Literal["morgan", "rdkit"]):
     mols = [Chem.MolFromSmiles(smile) for smile in smis]
-    mols = [m for m in mols if m is not None]  # can ghost remove but to bad
+    if y is None:
+        mols = [(m,y) for (m,y) in zip(mols, y) if m is not None]# can ghost remove but to bad
+        y = np.array([_[1] for _ in mols])
+        mols = [_[0] for _ in mols]
+    else:
+        mols = [m for m in mols if m is not None]
     if func == "morgan":
-        return [calc_morgan(c) for c in mols]
+        return [calc_morgan(c) for c in mols], y
     if func == "rdkit":
-        return np.array([calc_rdkit(c) for c in mols])
+        return np.array([calc_rdkit(c) for c in mols]), y
     raise ValueError(f"cannot find func {func}")
 
 
 def flatten(smis):
-    mols = [Chem.MolFromSmiles(smile) for smile in smis]
+    mols = []
+    for i, smile in enumerate(smis):
+        mols.append(Chem.MolFromSmiles(smile))
+        if ((i+1) % 100000 == 0):
+            logger.info(f"finished {i}")
     mols = [m for m in mols if m is not None]  # can ghost remove but to bad
     return [Chem.MolToSmiles(mol, isomericSmiles=False) for mol in mols]
 
 
 def load_smiles(file_path, smi_col, label_col=None, delimiter=",", header=True):
-    df = pd.read_csv(file_path, delimiter=delimiter, header=header)
+    df = pd.read_csv(file_path, delimiter=delimiter, header=0 if header else None)
 
     smiles = df[smi_col]
 
@@ -545,7 +561,7 @@ class ChipGenerateDataset(Dataset, _BaseChip):
 def _filter_by_dock_scores(smiles_lst, clf, threshold=0.6):
     if len(smiles_lst) == 0:
         return smiles_lst
-    _fps = get_fps(smiles_lst, func="rdkit")
+    _fps, _ = get_fps(smiles_lst, None, func="rdkit")
     if len(_fps.shape) == 1:
         _fps = _fps.reshape(1, -1)
 
@@ -684,20 +700,24 @@ def filter_and_generate(smiles: List,
         prefix = str(time.time()).replace('.', '')
     if out_dir is None:
         out_dir = os.getcwd()
-
+    logger.info("starting flatten")
     # flatten and canonicalize smis for CHIP
     smiles = flatten(smiles)
+    logger.info("flattened")
 
     # get score threshold (#TODO assumes lower scores are better)
     score_thresh = np.quantile(labels, score_quantile)
     y = (labels <= score_thresh).astype(np.int8)
-
+    logger.info("threshold")
     # train filter model if required
     if do_filter:
         if clf_model_path is None:
-            x = get_fps(smiles, func="rdkit")
+            logger.info("starting fps")
+            x, y = get_fps(smiles, y, func="rdkit")
             x = x.astype(float)
+            logger.info("fps done")
             clf = RandomForestClassifier(n_jobs=-1).fit(x, y)
+            logger.info("clf done")
             if save_models:
                 dump(clf, os.path.join(out_dir, f"{prefix}_RF.joblib"))
             del x
@@ -705,13 +725,14 @@ def filter_and_generate(smiles: List,
             clf = load(clf_model_path)
 
     smiles = np.array(smiles)
-
+    logger.info("smiles done")
     # collect to smis based on threshold
     top_smiles = smiles[y.astype(bool)]
     top_scores = labels[y.astype(bool)]
 
     # cluster top set
     if cluster_biasing_set:
+        logger.info("I'm clustering")
         top_smiles, top_scores = _cluster_biasing_set(top_smiles, top_scores, cluster_threshold)
 
     # save additional output files
@@ -721,7 +742,8 @@ def filter_and_generate(smiles: List,
                 f.write(f"{smi},{score}\n")
 
     # finetune generative model if need be
-    fine_tune_dataset = ChipGenerateDataset(smiles, use_cuda=use_cuda, device=DEVICE)
+    logger.info("starting finetune")
+    fine_tune_dataset = ChipGenerateDataset(top_smiles, use_cuda=use_cuda, device=DEVICE)
     if not gen_model_tuned:
         _save = os.path.join(out_dir, f"{prefix}_tuned.pt") if save_models else False
         model = fine_tune(fine_tune_dataset, model_path=gen_model_path, use_cuda=use_cuda,
@@ -729,6 +751,7 @@ def filter_and_generate(smiles: List,
     else:
         model = load_pretrained_gen_model(gen_model_path)
 
+    logger.info("finetune done")
     del fine_tune_dataset  # remove to save memory
 
     denovo_hits = []
@@ -737,6 +760,7 @@ def filter_and_generate(smiles: List,
 
     # loop through generation until complete
     while num_hits < tot_hits:
+        logger.info("batch")
         batch_denovo_raw = model.generate(batch_size=batch_size, use_cuda=use_cuda, device=DEVICE)
         batch_denovo = flatten(batch_denovo_raw)
         batch_hits = np.array(list(set(batch_denovo) - set(top_smiles).union(set(denovo_hits))))
@@ -910,6 +934,7 @@ if __name__ == "__main__":
         DEVICE = "cuda"
 
     if args.bias_set:
+        logger.info("starting with bias")
         smiles = load_smiles(args.inpath, delimiter=',', smi_col=args.smi_col, header=True)
         os.makedirs(args.outdir, exist_ok=True)
 
@@ -936,8 +961,10 @@ if __name__ == "__main__":
                                      prefix=args.prefix)
 
     else:
+        logger.info("starting without bias")
         smiles, labels = load_smiles(args.inpath, delimiter=',', smi_col=args.smi_col,
                                      label_col=args.score_col, header=True)
+        logger.info("smiles loaded")
 
         _tuned_model = False
         _filter_model_path = None
