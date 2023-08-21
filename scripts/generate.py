@@ -700,6 +700,7 @@ def filter_and_generate(smiles: List,
             clf = RandomForestClassifier(n_jobs=-1).fit(x, y)
             if save_models:
                 dump(clf, os.path.join(out_dir, f"{prefix}_RF.joblib"))
+            del x
         else:
             clf = load(clf_model_path)
 
