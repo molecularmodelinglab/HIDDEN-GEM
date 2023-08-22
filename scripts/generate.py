@@ -97,14 +97,19 @@ def get_fps(smis, y, func: Literal["morgan", "rdkit"]):
     raise ValueError(f"cannot find func {func}")
 
 
-def flatten(smis):
+def flatten(smis, y):
     mols = []
     for i, smile in enumerate(smis):
         mols.append(Chem.MolFromSmiles(smile))
         if ((i+1) % 100000 == 0):
             logger.info(f"finished {i}")
-    mols = [m for m in mols if m is not None]  # can ghost remove but to bad
-    return [Chem.MolToSmiles(mol, isomericSmiles=False) for mol in mols]
+    if y is not None:
+        mols = [(m, y) for (m, y) in zip(mols, y) if m is not None]# can ghost remove but to bad
+        y = np.array([_[1] for _ in mols])
+        mols = [_[0] for _ in mols]
+    else:
+        mols = [m for m in mols if m is not None]
+    return [Chem.MolToSmiles(mol, isomericSmiles=False) for mol in mols], y
 
 
 def load_smiles(file_path, smi_col, label_col=None, delimiter=",", header=True):
@@ -702,8 +707,10 @@ def filter_and_generate(smiles: List,
         out_dir = os.getcwd()
     logger.info("starting flatten")
     # flatten and canonicalize smis for CHIP
-    smiles = flatten(smiles)
+    smiles, labels = flatten(smiles, labels)
     logger.info("flattened")
+    logger.info(f"length smiles: {len(smiles)}")
+    logger.info(f"length labels: {len(labels)}")
 
     # get score threshold (#TODO assumes lower scores are better)
     score_thresh = np.quantile(labels, score_quantile)
@@ -762,14 +769,14 @@ def filter_and_generate(smiles: List,
     while num_hits < tot_hits:
         logger.info("batch")
         batch_denovo_raw = model.generate(batch_size=batch_size, use_cuda=use_cuda, device=DEVICE)
-        batch_denovo = flatten(batch_denovo_raw)
+        batch_denovo, _ = flatten(batch_denovo_raw, None)
         batch_hits = np.array(list(set(batch_denovo) - set(top_smiles).union(set(denovo_hits))))
         if do_filter:
             batch_hits = _filter_by_dock_scores(batch_hits, clf, threshold=conf_thresh)
         if diverse_thresh is not None:
             batch_hits = _filter_by_diversity(batch_hits, denovo_fps, threshold=diverse_thresh)
         denovo_hits.extend(batch_hits)
-        denovo_fps.extend(get_fps(denovo_hits, func="morgan"))
+        denovo_fps.extend(get_fps(denovo_hits, None, func="morgan")[0])
         num_hits += len(batch_hits)
 
         if save_auxiliary_files:
