@@ -84,7 +84,7 @@ def calc_morgan(mol, radius=4, n_bits=256, count=False, use_chirality=True):
 
 def get_fps(smis, y, func: Literal["morgan", "rdkit"]):
     mols = [Chem.MolFromSmiles(smile) for smile in smis]
-    if y is None:
+    if y is not None:
         mols = [(m,y) for (m,y) in zip(mols, y) if m is not None]# can ghost remove but to bad
         y = np.array([_[1] for _ in mols])
         mols = [_[0] for _ in mols]
